@@ -209,8 +209,16 @@ jobs:
           DOWN_MBPS=$(jq -r '(.end.sum_sent.bits_per_second // .end.sum_received.bits_per_second // 0) / 1000000' tcp_to_home.json 2>/dev/null)
           UP_MBPS=$(jq -r '(.end.sum_received.bits_per_second // .end.sum_sent.bits_per_second // 0) / 1000000' tcp_from_home.json 2>/dev/null)
 
+          DOWN_BYTES=$(jq -r '(.end.sum_sent.bytes // .end.sum_received.bytes // 0)' tcp_to_home.json 2>/dev/null)
+          UP_BYTES=$(jq -r '(.end.sum_received.bytes // .end.sum_sent.bytes // 0)' tcp_from_home.json 2>/dev/null)
+
           DOWN_MBPS_ROUNDED=$(printf "%.1f" "$DOWN_MBPS")
           UP_MBPS_ROUNDED=$(printf "%.1f" "$UP_MBPS")
+
+          DOWN_MB=$(awk -v b="$DOWN_BYTES" 'BEGIN { printf "%.1f", b / 1000000 }')
+          UP_MB=$(awk -v b="$UP_BYTES" 'BEGIN { printf "%.1f", b / 1000000 }')
+          TOTAL_BYTES=$((DOWN_BYTES + UP_BYTES))
+          TOTAL_MB=$(awk -v b="$TOTAL_BYTES" 'BEGIN { printf "%.1f", b / 1000000 }')
 
           echo "--------------------------------"
           echo "下り（外部→自宅）Mbps: $DOWN_MBPS_ROUNDED"
@@ -218,11 +226,20 @@ jobs:
           echo "Down exit: $DOWN_EXIT"
           echo "Up exit:   $UP_EXIT"
           echo "--------------------------------"
+          echo "通信量目安 iperf本体のみ:"
+          echo "下り（外部→自宅）: ${DOWN_MB} MB"
+          echo "上り（自宅→外部）: ${UP_MB} MB"
+          echo "合計: ${TOTAL_MB} MB"
+          echo "--------------------------------"
 
           echo "down_mbps=$DOWN_MBPS_ROUNDED" >> "$GITHUB_OUTPUT"
           echo "up_mbps=$UP_MBPS_ROUNDED" >> "$GITHUB_OUTPUT"
           echo "down_exit=$DOWN_EXIT" >> "$GITHUB_OUTPUT"
           echo "up_exit=$UP_EXIT" >> "$GITHUB_OUTPUT"
+
+          echo "down_mb=$DOWN_MB" >> "$GITHUB_OUTPUT"
+          echo "up_mb=$UP_MB" >> "$GITHUB_OUTPUT"
+          echo "total_mb=$TOTAL_MB" >> "$GITHUB_OUTPUT"
 
           if [ "$DOWN_EXIT" -ne 0 ] || [ "$UP_EXIT" -ne 0 ]; then
             echo "iperf3 failed after retries"
@@ -292,6 +309,12 @@ jobs:
           **速度**
           下り（外部→自宅）: ${{ steps.speed.outputs.down_mbps }} Mbps
           上り（自宅→外部）: ${{ steps.speed.outputs.up_mbps }} Mbps
+
+          **通信量目安**
+          iperf本体のみ・IP/TCP等のオーバーヘッド除く
+          下り（外部→自宅）: ${{ steps.speed.outputs.down_mb }} MB
+          上り（自宅→外部）: ${{ steps.speed.outputs.up_mb }} MB
+          合計: ${{ steps.speed.outputs.total_mb }} MB
 
           **次回予定**
           ${NEXT_JST}
