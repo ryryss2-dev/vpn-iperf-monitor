@@ -104,7 +104,7 @@ jobs:
           echo
 
           echo "=== TCP traceroute target port 40017 ==="
-          traceroute -T -p "$PORT" "$HOST" || true
+          sudo traceroute -T -p "$PORT" "$HOST" || true
           echo
 
       - name: Run iperf3 tests
