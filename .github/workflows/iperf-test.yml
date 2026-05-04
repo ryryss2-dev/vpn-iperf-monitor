@@ -272,18 +272,32 @@ jobs:
           **VPN外部測定 ${STATUS}**
 
           実行時刻: ${NOW_JST}
-          次回予定: ${NEXT_JST}
-          測定予定: ${SCHEDULE_TEXT}
 
+          **測定元**
+          GitHub Actions Runner
           発信元: ${{ steps.source.outputs.org }} / ${{ steps.source.outputs.city }}, ${{ steps.source.outputs.region }}, 国: ${{ steps.source.outputs.country }}
           発信元IP: ${{ steps.source.outputs.public_ip }}
-          宛先: rayglintt11222.softether.net → ${{ steps.source.outputs.dns_ip }}:40017
 
+          **測定方向**
+          下り: 外部Runner → 自宅HM80
+          上り: 自宅HM80 → 外部Runner
+
+          **接続先**
+          自宅HM80: rayglintt11222.softether.net → ${{ steps.source.outputs.dns_ip }}:40017
+
+          **遅延**
           TCP Ping相当: avg ${{ steps.ping.outputs.tcp_avg_ms }} ms / min ${{ steps.ping.outputs.tcp_min_ms }} ms / max ${{ steps.ping.outputs.tcp_max_ms }} ms / success ${{ steps.ping.outputs.tcp_success }}/${{ steps.ping.outputs.tcp_attempts }}
           ICMP Ping: ${{ steps.ping.outputs.ping_loss }}
 
+          **速度**
           下り（外部→自宅）: ${{ steps.speed.outputs.down_mbps }} Mbps
           上り（自宅→外部）: ${{ steps.speed.outputs.up_mbps }} Mbps
+
+          **次回予定**
+          ${NEXT_JST}
+
+          **測定予定**
+          ${SCHEDULE_TEXT}
           EOF
           )"
 
@@ -296,7 +310,10 @@ jobs:
 
           jq -n --arg content "$CONTENT" '{content: $content}' > discord_payload.json
 
-          curl -sS \
+          HTTP_CODE="$(curl -sS -o discord_response.txt -w "%{http_code}" \
             -H "Content-Type: application/json" \
             -d @discord_payload.json \
-            "$DISCORD_WEBHOOK_URL"
+            "$DISCORD_WEBHOOK_URL")"
+
+          echo "Discord HTTP status: $HTTP_CODE"
+          cat discord_response.txt || true
