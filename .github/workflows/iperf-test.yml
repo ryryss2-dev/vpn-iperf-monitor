@@ -46,16 +46,65 @@ jobs:
           HOST="rayglintt11222.softether.net"
           PORT="40017"
 
-          echo "=== Ping target ==="
-          ping -c 5 "$HOST" || true
+          echo "=== ICMP ping target ==="
+          ping -c 5 "$HOST" | tee ping.txt
+          PING_EXIT=${PIPESTATUS[0]}
+          echo "ICMP ping exit: $PING_EXIT"
+          echo
+
+          PING_LOSS="$(grep -oE '[0-9]+% packet loss' ping.txt | head -1 || true)"
+          PING_RTT="$(grep -E 'rtt min/avg/max|round-trip min/avg/max' ping.txt | head -1 || true)"
+
+          echo "=== ICMP ping summary ==="
+          echo "ICMP ping loss: ${PING_LOSS:-unknown}"
+          echo "ICMP ping rtt: ${PING_RTT:-not available, likely blocked}"
+          echo
+
+          echo "=== TCP connect latency to port 40017 ==="
+          python3 - <<'PY'
+          import socket
+          import time
+          import statistics
+
+          host = "rayglintt11222.softether.net"
+          port = 40017
+          attempts = 10
+          timeout = 5.0
+          results = []
+
+          for i in range(1, attempts + 1):
+              start = time.perf_counter()
+              try:
+                  with socket.create_connection((host, port), timeout=timeout):
+                      elapsed_ms = (time.perf_counter() - start) * 1000
+                      results.append(elapsed_ms)
+                      print(f"tcp_connect_{i}: ok {elapsed_ms:.1f} ms")
+              except Exception as e:
+                  elapsed_ms = (time.perf_counter() - start) * 1000
+                  print(f"tcp_connect_{i}: fail {elapsed_ms:.1f} ms error={e}")
+              time.sleep(0.5)
+
+          if results:
+              print("--- TCP latency summary ---")
+              print(f"tcp_connect_success: {len(results)}/{attempts}")
+              print(f"tcp_connect_min_ms: {min(results):.1f}")
+              print(f"tcp_connect_avg_ms: {statistics.mean(results):.1f}")
+              print(f"tcp_connect_max_ms: {max(results):.1f}")
+          else:
+              print("--- TCP latency summary ---")
+              print(f"tcp_connect_success: 0/{attempts}")
+              print("tcp_connect_avg_ms: unavailable")
+          PY
           echo
 
           echo "=== TCP port check ==="
-          nc -vz -w 8 "$HOST" "$PORT" || true
+          nc -vz -w 8 "$HOST" "$PORT"
+          TCP_EXIT=$?
+          echo "TCP port check exit: $TCP_EXIT"
           echo
 
-          echo "=== Traceroute target ==="
-          traceroute "$HOST" || true
+          echo "=== TCP traceroute target port 40017 ==="
+          traceroute -T -p "$PORT" "$HOST" || true
           echo
 
       - name: Run iperf3 tests
