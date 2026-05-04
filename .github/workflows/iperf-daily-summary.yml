@@ -165,16 +165,16 @@ jobs:
               return rows
 
           def best_worst_bucket(rows, key, lower_is_better=False):
-              valid = [r for r in rows if r.get(key) is not None]
-              if not valid:
-                  return None, None
+              valid = [r for r in rows if r.get("count", 0) > 0 and r.get(key) is not None]
+              if len(valid) < 2:
+                  return None, None, valid
               if lower_is_better:
                   best = min(valid, key=lambda r: r[key])
                   worst = max(valid, key=lambda r: r[key])
               else:
                   best = max(valid, key=lambda r: r[key])
                   worst = min(valid, key=lambda r: r[key])
-              return best, worst
+              return best, worst, valid
 
           target_date = os.environ.get("TARGET_DATE", "").strip()
           if not target_date:
@@ -191,9 +191,9 @@ jobs:
           p = summarize(prev_records)
           buckets = bucket_summary(day_records)
 
-          down_best, down_worst = best_worst_bucket(buckets, "down_avg", lower_is_better=False)
-          up_best, up_worst = best_worst_bucket(buckets, "up_avg", lower_is_better=False)
-          ping_best, ping_worst = best_worst_bucket(buckets, "ping_avg", lower_is_better=True)
+          down_best, down_worst, down_valid = best_worst_bucket(buckets, "down_avg", lower_is_better=False)
+          up_best, up_worst, up_valid = best_worst_bucket(buckets, "up_avg", lower_is_better=False)
+          ping_best, ping_worst, ping_valid = best_worst_bucket(buckets, "ping_avg", lower_is_better=True)
 
           lines = []
           lines.append("**VPN外部測定 日次サマリー**")
@@ -224,21 +224,37 @@ jobs:
               )
           lines.append("")
           lines.append("**傾向メモ**")
-          if down_best and down_worst:
+
+          valid_bucket_count = len([b for b in buckets if b.get("count", 0) > 0])
+
+          if s["ok_count"] == 0:
+              lines.append("今日は成功データがまだないため、速度・Pingの傾向判断は保留。")
+          elif s["ok_count"] < 3:
+              lines.append(f"今日は成功データが{s['ok_count']}件だけなので、平均値は参考値。もう少し測定が貯まってから判断する。")
+          else:
+              lines.append(f"今日は成功データが{s['ok_count']}件あるため、平均値はある程度参考にできる。")
+
+          if valid_bucket_count < 2:
               lines.append(
-                  f"下りは {down_best['name']} が速め（{fmt(down_best['down_avg'], ' Mbps')}）、"
-                  f"{down_worst['name']} が遅め（{fmt(down_worst['down_avg'], ' Mbps')}）。"
+                  "時間帯比較はデータ不足のため保留。"
+                  "有効な時間帯が2つ以上そろうと、昼が遅い・夜が速いなどの傾向を出す。"
               )
-          if up_best and up_worst:
-              lines.append(
-                  f"上りは {up_best['name']} が速め（{fmt(up_best['up_avg'], ' Mbps')}）、"
-                  f"{up_worst['name']} が遅め（{fmt(up_worst['up_avg'], ' Mbps')}）。"
-              )
-          if ping_best and ping_worst:
-              lines.append(
-                  f"Pingは {ping_best['name']} が良好（{fmt(ping_best['ping_avg'], ' ms')}）、"
-                  f"{ping_worst['name']} が重め（{fmt(ping_worst['ping_avg'], ' ms')}）。"
-              )
+          else:
+              if down_best and down_worst:
+                  lines.append(
+                      f"下りは {down_best['name']} が速め（{fmt(down_best['down_avg'], ' Mbps')}）、"
+                      f"{down_worst['name']} が遅め（{fmt(down_worst['down_avg'], ' Mbps')}）。"
+                  )
+              if up_best and up_worst:
+                  lines.append(
+                      f"上りは {up_best['name']} が速め（{fmt(up_best['up_avg'], ' Mbps')}）、"
+                      f"{up_worst['name']} が遅め（{fmt(up_worst['up_avg'], ' Mbps')}）。"
+                  )
+              if ping_best and ping_worst:
+                  lines.append(
+                      f"Pingは {ping_best['name']} が良好（{fmt(ping_best['ping_avg'], ' ms')}）、"
+                      f"{ping_worst['name']} が重め（{fmt(ping_worst['ping_avg'], ' ms')}）。"
+                  )
 
           if not day_records:
               lines = [
