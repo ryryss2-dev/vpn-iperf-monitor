@@ -6,13 +6,57 @@ on:
 jobs:
   iperf:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 8
 
     steps:
-      - name: Install iperf3
+      - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y iperf3 jq
+          sudo apt-get install -y iperf3 jq iputils-ping traceroute dnsutils netcat-openbsd curl
+
+      - name: Show runner source
+        run: |
+          set +e
+
+          echo "=== Runner basic info ==="
+          echo "UTC time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          echo "Local hostname: $(hostname)"
+          echo "OS:"
+          uname -a
+          echo
+
+          echo "=== Public source IP ==="
+          PUBLIC_IP="$(curl -s https://api.ipify.org || true)"
+          echo "Public IP: $PUBLIC_IP"
+          echo
+
+          echo "=== Public IP geo / ASN estimate ==="
+          curl -s https://ipinfo.io/json || true
+          echo
+          echo
+
+          echo "=== DNS lookup target ==="
+          dig +short rayglintt11222.softether.net || true
+          echo
+
+      - name: Ping and route checks
+        run: |
+          set +e
+
+          HOST="rayglintt11222.softether.net"
+          PORT="40017"
+
+          echo "=== Ping target ==="
+          ping -c 5 "$HOST" || true
+          echo
+
+          echo "=== TCP port check ==="
+          nc -vz -w 8 "$HOST" "$PORT" || true
+          echo
+
+          echo "=== Traceroute target ==="
+          traceroute "$HOST" || true
+          echo
 
       - name: Run iperf3 tests
         run: |
@@ -22,11 +66,11 @@ jobs:
           PORT="40017"
 
           echo "=== TCP GitHub -> Home ==="
-          iperf3 -c "$HOST" -p "$PORT" -n 10M --json > tcp_to_home.json
+          iperf3 -c "$HOST" -p "$PORT" -t 5 --json > tcp_to_home.json
           TO_HOME_EXIT=$?
 
           echo "=== TCP Home -> GitHub ==="
-          iperf3 -c "$HOST" -p "$PORT" -R -n 10M --json > tcp_from_home.json
+          iperf3 -c "$HOST" -p "$PORT" -R -t 5 --json > tcp_from_home.json
           FROM_HOME_EXIT=$?
 
           TO_HOME_MBPS=$(jq -r '(.end.sum_sent.bits_per_second // 0) / 1000000' tcp_to_home.json 2>/dev/null)
