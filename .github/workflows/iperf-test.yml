@@ -248,6 +248,130 @@ jobs:
             exit 1
           fi
 
+      - name: Evaluate thresholds
+        id: alert
+        if: always()
+        continue-on-error: true
+        env:
+          DOWN_MBPS: ${{ steps.speed.outputs.down_mbps }}
+          UP_MBPS: ${{ steps.speed.outputs.up_mbps }}
+          TCP_AVG_MS: ${{ steps.ping.outputs.tcp_avg_ms }}
+          TCP_SUCCESS: ${{ steps.ping.outputs.tcp_success }}
+          TCP_ATTEMPTS: ${{ steps.ping.outputs.tcp_attempts }}
+          DOWN_EXIT: ${{ steps.speed.outputs.down_exit }}
+          UP_EXIT: ${{ steps.speed.outputs.up_exit }}
+          TCP_PORT_EXIT: ${{ steps.ping.outputs.tcp_port_exit }}
+          DOWN_WARN_MBPS: "10"
+          UP_WARN_MBPS: "30"
+          PING_WARN_MS: "250"
+        run: |
+          set +e
+
+          python3 - <<'PY' > alert.json
+          import json
+          import os
+
+          def s(name, default=""):
+              return (os.environ.get(name) or default).strip()
+
+          def f(name):
+              value = s(name)
+              try:
+                  return float(value)
+              except Exception:
+                  return None
+
+          def i(name):
+              value = s(name)
+              try:
+                  return int(float(value))
+              except Exception:
+                  return None
+
+          down = f("DOWN_MBPS")
+          up = f("UP_MBPS")
+          ping = f("TCP_AVG_MS")
+          tcp_success = i("TCP_SUCCESS")
+          tcp_attempts = i("TCP_ATTEMPTS") or 10
+
+          down_warn = f("DOWN_WARN_MBPS") or 10.0
+          up_warn = f("UP_WARN_MBPS") or 30.0
+          ping_warn = f("PING_WARN_MS") or 250.0
+
+          down_exit = s("DOWN_EXIT", "unknown")
+          up_exit = s("UP_EXIT", "unknown")
+          tcp_port_exit = s("TCP_PORT_EXIT", "unknown")
+
+          ng = []
+          warn = []
+
+          if tcp_port_exit != "0":
+              ng.append(f"TCP 40017疎通失敗 tcp_port_exit={tcp_port_exit}")
+
+          if down_exit != "0":
+              ng.append(f"下りiperf失敗 down_exit={down_exit}")
+
+          if up_exit != "0":
+              ng.append(f"上りiperf失敗 up_exit={up_exit}")
+
+          if down is None:
+              warn.append("下り速度が取得できなかった")
+          elif down < down_warn:
+              warn.append(f"下りが低い: {down:.1f} Mbps < {down_warn:.1f} Mbps")
+
+          if up is None:
+              warn.append("上り速度が取得できなかった")
+          elif up < up_warn:
+              warn.append(f"上りが低い: {up:.1f} Mbps < {up_warn:.1f} Mbps")
+
+          if ping is None:
+              warn.append("TCP Ping相当が取得できなかった")
+          elif ping >= ping_warn:
+              warn.append(f"TCP Pingが重い: {ping:.1f} ms >= {ping_warn:.1f} ms")
+
+          if tcp_success is None:
+              warn.append("TCP Ping成功数が取得できなかった")
+          elif tcp_success < tcp_attempts:
+              warn.append(f"TCP Ping成功数が不足: {tcp_success}/{tcp_attempts}")
+
+          if ng:
+              status = "NG"
+              reasons = ng + warn
+          elif warn:
+              status = "WARNING"
+              reasons = warn
+          else:
+              status = "OK"
+              reasons = ["しきい値超過なし"]
+
+          result = {
+              "alert_status": status,
+              "alert_reason_count": len(reasons),
+              "alert_reasons": reasons,
+              "thresholds": {
+                  "down_warn_mbps": down_warn,
+                  "up_warn_mbps": up_warn,
+                  "ping_warn_ms": ping_warn,
+              },
+          }
+
+          print(json.dumps(result, ensure_ascii=False, indent=2))
+          PY
+
+          cat alert.json
+
+          ALERT_STATUS="$(jq -r '.alert_status // "UNKNOWN"' alert.json)"
+          ALERT_REASON_COUNT="$(jq -r '.alert_reason_count // 0' alert.json)"
+          jq -r '.alert_reasons[]?' alert.json > alert_reasons.txt
+
+          {
+            echo "alert_status=$ALERT_STATUS"
+            echo "alert_reason_count=$ALERT_REASON_COUNT"
+            echo "alert_reasons<<EOF"
+            cat alert_reasons.txt
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Save sanitized result
         id: save_result
         if: always()
@@ -263,10 +387,19 @@ jobs:
           UP_EXIT="${{ steps.speed.outputs.up_exit }}"
           TCP_PORT_EXIT="${{ steps.ping.outputs.tcp_port_exit }}"
 
-          STATUS="OK"
+          MEASURE_STATUS="OK"
           if [ "$DOWN_EXIT" != "0" ] || [ "$UP_EXIT" != "0" ] || [ "$TCP_PORT_EXIT" != "0" ]; then
-            STATUS="NG"
+            MEASURE_STATUS="NG"
           fi
+
+          ALERT_STATUS="${{ steps.alert.outputs.alert_status }}"
+          ALERT_REASON_COUNT="${{ steps.alert.outputs.alert_reason_count }}"
+          ALERT_STATUS="${ALERT_STATUS:-UNKNOWN}"
+          ALERT_REASON_COUNT="${ALERT_REASON_COUNT:-0}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git pull --rebase origin main || true
 
           mkdir -p data
 
@@ -296,7 +429,9 @@ jobs:
             --arg timestamp_jst "$NOW_JST" \
             --arg date_jst "$DATE_JST" \
             --arg hour_jst "$HOUR_JST" \
-            --arg status "$STATUS" \
+            --arg status "$MEASURE_STATUS" \
+            --arg alert_status "$ALERT_STATUS" \
+            --arg alert_reason_count "$ALERT_REASON_COUNT" \
             --arg trigger "${{ github.event_name }}" \
             --arg run_id "${{ github.run_id }}" \
             --arg run_number "${{ github.run_number }}" \
@@ -320,6 +455,8 @@ jobs:
               date_jst: $date_jst,
               hour_jst: ($hour_jst | n),
               status: $status,
+              alert_status: $alert_status,
+              alert_reason_count: ($alert_reason_count | n),
               trigger: $trigger,
               run_id: $run_id,
               run_number: ($run_number | n),
@@ -341,9 +478,6 @@ jobs:
 
           echo "=== Saved sanitized result ==="
           tail -1 data/iperf-results.jsonl
-
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           git add data/iperf-results.jsonl
 
@@ -393,17 +527,31 @@ jobs:
           UP_EXIT="${{ steps.speed.outputs.up_exit }}"
           TCP_PORT_EXIT="${{ steps.ping.outputs.tcp_port_exit }}"
 
-          STATUS="OK"
+          MEASURE_STATUS="OK"
           if [ "$DOWN_EXIT" != "0" ] || [ "$UP_EXIT" != "0" ] || [ "$TCP_PORT_EXIT" != "0" ]; then
-            STATUS="NG"
+            MEASURE_STATUS="NG"
+          fi
+
+          ALERT_STATUS="${{ steps.alert.outputs.alert_status }}"
+          ALERT_REASONS="$(cat <<'EOF_ALERT'
+          ${{ steps.alert.outputs.alert_reasons }}
+          EOF_ALERT
+          )"
+
+          ALERT_STATUS="${ALERT_STATUS:-UNKNOWN}"
+          if [ -z "$ALERT_REASONS" ]; then
+            ALERT_REASONS="しきい値判定なし"
           fi
 
           CONTENT="$(cat <<EOF
-          **VPN外部測定 ${STATUS}**
+          **VPN外部測定 ${ALERT_STATUS}**
 
           実行時刻: ${NOW_JST}
           実行種別: ${{ github.event_name }}
           起動元: HM80 Task Scheduler / GitHub API workflow_dispatch
+
+          **しきい値判定**
+          ${ALERT_REASONS}
 
           **測定元**
           GitHub Actions Runner
