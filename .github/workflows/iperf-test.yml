@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   iperf:
@@ -12,6 +12,9 @@ jobs:
     timeout-minutes: 10
 
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Install tools
         run: |
           sudo apt-get update
@@ -245,6 +248,116 @@ jobs:
             exit 1
           fi
 
+      - name: Save sanitized result
+        id: save_result
+        if: always()
+        continue-on-error: true
+        run: |
+          set +e
+
+          NOW_JST="$(TZ=Asia/Tokyo date '+%Y-%m-%d %H:%M:%S JST')"
+          DATE_JST="$(TZ=Asia/Tokyo date '+%Y-%m-%d')"
+          HOUR_JST="$(TZ=Asia/Tokyo date '+%H')"
+
+          DOWN_EXIT="${{ steps.speed.outputs.down_exit }}"
+          UP_EXIT="${{ steps.speed.outputs.up_exit }}"
+          TCP_PORT_EXIT="${{ steps.ping.outputs.tcp_port_exit }}"
+
+          STATUS="OK"
+          if [ "$DOWN_EXIT" != "0" ] || [ "$UP_EXIT" != "0" ] || [ "$TCP_PORT_EXIT" != "0" ]; then
+            STATUS="NG"
+          fi
+
+          mkdir -p data
+
+          DOWN_MBPS="${{ steps.speed.outputs.down_mbps }}"
+          UP_MBPS="${{ steps.speed.outputs.up_mbps }}"
+          TCP_AVG="${{ steps.ping.outputs.tcp_avg_ms }}"
+          TCP_MIN="${{ steps.ping.outputs.tcp_min_ms }}"
+          TCP_MAX="${{ steps.ping.outputs.tcp_max_ms }}"
+          TOTAL_MB="${{ steps.speed.outputs.total_mb }}"
+          DOWN_MB="${{ steps.speed.outputs.down_mb }}"
+          UP_MB="${{ steps.speed.outputs.up_mb }}"
+          TCP_SUCCESS="${{ steps.ping.outputs.tcp_success }}"
+          TCP_ATTEMPTS="${{ steps.ping.outputs.tcp_attempts }}"
+
+          DOWN_MBPS="${DOWN_MBPS:-0}"
+          UP_MBPS="${UP_MBPS:-0}"
+          TCP_AVG="${TCP_AVG:-0}"
+          TCP_MIN="${TCP_MIN:-0}"
+          TCP_MAX="${TCP_MAX:-0}"
+          TOTAL_MB="${TOTAL_MB:-0}"
+          DOWN_MB="${DOWN_MB:-0}"
+          UP_MB="${UP_MB:-0}"
+          TCP_SUCCESS="${TCP_SUCCESS:-0}"
+          TCP_ATTEMPTS="${TCP_ATTEMPTS:-10}"
+
+          jq -c -n \
+            --arg timestamp_jst "$NOW_JST" \
+            --arg date_jst "$DATE_JST" \
+            --arg hour_jst "$HOUR_JST" \
+            --arg status "$STATUS" \
+            --arg trigger "${{ github.event_name }}" \
+            --arg run_id "${{ github.run_id }}" \
+            --arg run_number "${{ github.run_number }}" \
+            --arg down_mbps "$DOWN_MBPS" \
+            --arg up_mbps "$UP_MBPS" \
+            --arg tcp_ping_avg_ms "$TCP_AVG" \
+            --arg tcp_ping_min_ms "$TCP_MIN" \
+            --arg tcp_ping_max_ms "$TCP_MAX" \
+            --arg tcp_success "$TCP_SUCCESS" \
+            --arg tcp_attempts "$TCP_ATTEMPTS" \
+            --arg down_mb "$DOWN_MB" \
+            --arg up_mb "$UP_MB" \
+            --arg total_mb "$TOTAL_MB" \
+            --arg down_exit "${DOWN_EXIT:-unknown}" \
+            --arg up_exit "${UP_EXIT:-unknown}" \
+            --arg tcp_port_exit "${TCP_PORT_EXIT:-unknown}" \
+            '
+            def n: try tonumber catch null;
+            {
+              timestamp_jst: $timestamp_jst,
+              date_jst: $date_jst,
+              hour_jst: ($hour_jst | n),
+              status: $status,
+              trigger: $trigger,
+              run_id: $run_id,
+              run_number: ($run_number | n),
+              down_mbps: ($down_mbps | n),
+              up_mbps: ($up_mbps | n),
+              tcp_ping_avg_ms: ($tcp_ping_avg_ms | n),
+              tcp_ping_min_ms: ($tcp_ping_min_ms | n),
+              tcp_ping_max_ms: ($tcp_ping_max_ms | n),
+              tcp_success: ($tcp_success | n),
+              tcp_attempts: ($tcp_attempts | n),
+              down_mb: ($down_mb | n),
+              up_mb: ($up_mb | n),
+              total_mb: ($total_mb | n),
+              down_exit: $down_exit,
+              up_exit: $up_exit,
+              tcp_port_exit: $tcp_port_exit
+            }
+            ' >> data/iperf-results.jsonl
+
+          echo "=== Saved sanitized result ==="
+          tail -1 data/iperf-results.jsonl
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add data/iperf-results.jsonl
+
+          if git diff --cached --quiet; then
+            echo "No result changes to commit."
+            echo "saved=no" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git commit -m "Add VPN iperf result ${NOW_JST}"
+          git push
+
+          echo "saved=yes" >> "$GITHUB_OUTPUT"
+
       - name: Notify Discord
         if: always()
         env:
@@ -317,6 +430,10 @@ jobs:
           下り（外部→自宅）: ${{ steps.speed.outputs.down_mb }} MB
           上り（自宅→外部）: ${{ steps.speed.outputs.up_mb }} MB
           合計: ${{ steps.speed.outputs.total_mb }} MB
+
+          **保存**
+          data/iperf-results.jsonl に軽量ログ保存: ${{ steps.save_result.outputs.saved }}
+          ※保存ログには発信元IP・自宅IP・traceroute全文は入れてない
 
           **次回予定**
           ${NEXT_JST}
