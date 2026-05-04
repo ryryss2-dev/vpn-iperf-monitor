@@ -3,6 +3,9 @@ name: VPN iperf test
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   iperf:
     runs-on: ubuntu-latest
@@ -80,8 +83,8 @@ jobs:
           python3 - <<'PY' > tcp_latency.txt
           import json
           import socket
-          import time
           import statistics
+          import time
 
           host = "rayglintt11222.softether.net"
           port = 40017
@@ -233,7 +236,6 @@ jobs:
           echo "up_mbps=$UP_MBPS_ROUNDED" >> "$GITHUB_OUTPUT"
           echo "down_exit=$DOWN_EXIT" >> "$GITHUB_OUTPUT"
           echo "up_exit=$UP_EXIT" >> "$GITHUB_OUTPUT"
-
           echo "down_mb=$DOWN_MB" >> "$GITHUB_OUTPUT"
           echo "up_mb=$UP_MB" >> "$GITHUB_OUTPUT"
           echo "total_mb=$TOTAL_MB" >> "$GITHUB_OUTPUT"
