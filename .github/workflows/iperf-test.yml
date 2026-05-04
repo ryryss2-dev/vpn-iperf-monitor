@@ -2,10 +2,6 @@ name: VPN iperf test
 
 on:
   workflow_dispatch:
-  schedule:
-    # TEST: every 5 minutes. GitHub Actions cron is UTC.
-    # After confirming scheduled runs work, change this back to the 2-hour schedule.
-    - cron: '*/5 * * * *'
 
 jobs:
   iperf:
@@ -261,21 +257,22 @@ jobs:
 
           tz = ZoneInfo("Asia/Tokyo")
           now = datetime.now(tz)
+          hours = [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22]
+          minute = 17
 
-          # TEST schedule: every 5 minutes
-          minute = ((now.minute // 5) + 1) * 5
-          next_time = now.replace(second=0, microsecond=0)
+          candidates = []
+          for add_day in range(0, 2):
+              day = (now + timedelta(days=add_day)).date()
+              for hour in hours:
+                  candidate = datetime(day.year, day.month, day.day, hour, minute, 0, tzinfo=tz)
+                  if candidate > now:
+                      candidates.append(candidate)
 
-          if minute >= 60:
-              next_time = next_time.replace(minute=0) + timedelta(hours=1)
-          else:
-              next_time = next_time.replace(minute=minute)
-
-          print(next_time.strftime("%Y-%m-%d %H:%M JST"))
+          print(min(candidates).strftime("%Y-%m-%d %H:%M JST"))
           PY
           )"
 
-          SCHEDULE_TEXT="テスト中: 5分ごと（自動実行確認用）"
+          SCHEDULE_TEXT="HM80タスクスケジューラから2時間ごとに起動：00:17 / 02:17 / 04:17 / 06:17 / 08:17 / 10:17 / 12:17 / 14:17 / 16:17 / 18:17 / 20:17 / 22:17 JST"
 
           DOWN_EXIT="${{ steps.speed.outputs.down_exit }}"
           UP_EXIT="${{ steps.speed.outputs.up_exit }}"
@@ -291,6 +288,7 @@ jobs:
 
           実行時刻: ${NOW_JST}
           実行種別: ${{ github.event_name }}
+          起動元: HM80 Task Scheduler / GitHub API workflow_dispatch
 
           **測定元**
           GitHub Actions Runner
