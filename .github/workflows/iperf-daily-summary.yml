@@ -1,0 +1,282 @@
+name: VPN iperf daily summary
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_date:
+        description: "集計対象日 JST。空なら今日。例: 2026-05-04"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  summarize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq curl
+
+      - name: Build daily summary
+        env:
+          TARGET_DATE: ${{ inputs.target_date }}
+        run: |
+          cat > summarize_daily.py <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          from datetime import datetime, timedelta
+          from zoneinfo import ZoneInfo
+          from statistics import mean
+
+          JST = ZoneInfo("Asia/Tokyo")
+          DATA_PATH = Path("data/iperf-results.jsonl")
+          EXPECTED_PER_DAY = 12
+
+          def to_float(value):
+              if value is None:
+                  return None
+              try:
+                  return float(value)
+              except Exception:
+                  return None
+
+          def to_int(value):
+              if value is None:
+                  return None
+              try:
+                  return int(value)
+              except Exception:
+                  return None
+
+          def avg(values):
+              values = [v for v in values if v is not None]
+              return mean(values) if values else None
+
+          def minv(values):
+              values = [v for v in values if v is not None]
+              return min(values) if values else None
+
+          def maxv(values):
+              values = [v for v in values if v is not None]
+              return max(values) if values else None
+
+          def fmt(value, unit="", digits=1):
+              if value is None:
+                  return "n/a"
+              return f"{value:.{digits}f}{unit}"
+
+          def fmt_delta(current, previous, unit="", lower_is_better=False):
+              if current is None or previous is None:
+                  return "比較なし"
+              delta = current - previous
+              if abs(delta) < 0.05:
+                  return f"±0.0{unit}（ほぼ同じ）"
+              sign = "+" if delta > 0 else ""
+              if lower_is_better:
+                  label = "改善" if delta < 0 else "悪化"
+              else:
+                  label = "上昇" if delta > 0 else "低下"
+              return f"{sign}{delta:.1f}{unit}（{label}）"
+
+          def load_records():
+              if not DATA_PATH.exists():
+                  return []
+              records = []
+              for line in DATA_PATH.read_text(encoding="utf-8").splitlines():
+                  line = line.strip()
+                  if not line:
+                      continue
+                  try:
+                      records.append(json.loads(line))
+                  except Exception:
+                      pass
+              return records
+
+          def enrich(records):
+              out = []
+              for r in records:
+                  rr = dict(r)
+                  rr["down_mbps_f"] = to_float(r.get("down_mbps"))
+                  rr["up_mbps_f"] = to_float(r.get("up_mbps"))
+                  rr["ping_f"] = to_float(r.get("tcp_ping_avg_ms"))
+                  rr["total_mb_f"] = to_float(r.get("total_mb"))
+                  rr["hour_i"] = to_int(r.get("hour_jst"))
+                  out.append(rr)
+              return out
+
+          def summarize(records):
+              ok = [
+                  r for r in records
+                  if r.get("status") == "OK"
+                  and r.get("down_mbps_f") is not None
+                  and r.get("up_mbps_f") is not None
+                  and r.get("ping_f") is not None
+              ]
+              return {
+                  "count": len(records),
+                  "ok_count": len(ok),
+                  "ng_count": len(records) - len(ok),
+                  "down_avg": avg([r.get("down_mbps_f") for r in ok]),
+                  "down_min": minv([r.get("down_mbps_f") for r in ok]),
+                  "down_max": maxv([r.get("down_mbps_f") for r in ok]),
+                  "up_avg": avg([r.get("up_mbps_f") for r in ok]),
+                  "up_min": minv([r.get("up_mbps_f") for r in ok]),
+                  "up_max": maxv([r.get("up_mbps_f") for r in ok]),
+                  "ping_avg": avg([r.get("ping_f") for r in ok]),
+                  "ping_min": minv([r.get("ping_f") for r in ok]),
+                  "ping_max": maxv([r.get("ping_f") for r in ok]),
+                  "total_mb": sum([r.get("total_mb_f") or 0 for r in ok]),
+              }
+
+          def bucket_summary(records):
+              buckets = [
+                  ("深夜", "00-05", range(0, 6)),
+                  ("朝", "06-11", range(6, 12)),
+                  ("昼", "12-17", range(12, 18)),
+                  ("夜", "18-23", range(18, 24)),
+              ]
+              rows = []
+              for name, label, hours in buckets:
+                  items = [
+                      r for r in records
+                      if r.get("status") == "OK"
+                      and r.get("hour_i") in hours
+                      and r.get("down_mbps_f") is not None
+                      and r.get("up_mbps_f") is not None
+                      and r.get("ping_f") is not None
+                  ]
+                  rows.append({
+                      "name": name,
+                      "label": label,
+                      "count": len(items),
+                      "down_avg": avg([r.get("down_mbps_f") for r in items]),
+                      "up_avg": avg([r.get("up_mbps_f") for r in items]),
+                      "ping_avg": avg([r.get("ping_f") for r in items]),
+                  })
+              return rows
+
+          def best_worst_bucket(rows, key, lower_is_better=False):
+              valid = [r for r in rows if r.get(key) is not None]
+              if not valid:
+                  return None, None
+              if lower_is_better:
+                  best = min(valid, key=lambda r: r[key])
+                  worst = max(valid, key=lambda r: r[key])
+              else:
+                  best = max(valid, key=lambda r: r[key])
+                  worst = min(valid, key=lambda r: r[key])
+              return best, worst
+
+          target_date = os.environ.get("TARGET_DATE", "").strip()
+          if not target_date:
+              target_date = datetime.now(JST).strftime("%Y-%m-%d")
+
+          target_dt = datetime.strptime(target_date, "%Y-%m-%d").date()
+          prev_date = (target_dt - timedelta(days=1)).strftime("%Y-%m-%d")
+
+          all_records = enrich(load_records())
+          day_records = [r for r in all_records if r.get("date_jst") == target_date]
+          prev_records = [r for r in all_records if r.get("date_jst") == prev_date]
+
+          s = summarize(day_records)
+          p = summarize(prev_records)
+          buckets = bucket_summary(day_records)
+
+          down_best, down_worst = best_worst_bucket(buckets, "down_avg", lower_is_better=False)
+          up_best, up_worst = best_worst_bucket(buckets, "up_avg", lower_is_better=False)
+          ping_best, ping_worst = best_worst_bucket(buckets, "ping_avg", lower_is_better=True)
+
+          lines = []
+          lines.append("**VPN外部測定 日次サマリー**")
+          lines.append("")
+          lines.append(f"対象日: {target_date}")
+          lines.append(f"測定回数: {s['count']} / 予定{EXPECTED_PER_DAY}回")
+          lines.append(f"成功: {s['ok_count']}回 / 失敗: {s['ng_count']}回")
+          lines.append("")
+          lines.append("**平均・最高・最低**")
+          lines.append(f"TCP Ping平均: {fmt(s['ping_avg'], ' ms')} / 最良 {fmt(s['ping_min'], ' ms')} / 最悪 {fmt(s['ping_max'], ' ms')}")
+          lines.append(f"下り平均: {fmt(s['down_avg'], ' Mbps')} / 最高 {fmt(s['down_max'], ' Mbps')} / 最低 {fmt(s['down_min'], ' Mbps')}")
+          lines.append(f"上り平均: {fmt(s['up_avg'], ' Mbps')} / 最高 {fmt(s['up_max'], ' Mbps')} / 最低 {fmt(s['up_min'], ' Mbps')}")
+          lines.append(f"通信量合計: {fmt(s['total_mb'], ' MB')}")
+          lines.append("")
+          lines.append("**昨日比**")
+          lines.append(f"TCP Ping: {fmt_delta(s['ping_avg'], p['ping_avg'], ' ms', lower_is_better=True)}")
+          lines.append(f"下り: {fmt_delta(s['down_avg'], p['down_avg'], ' Mbps')}")
+          lines.append(f"上り: {fmt_delta(s['up_avg'], p['up_avg'], ' Mbps')}")
+          lines.append("")
+          lines.append("**時間帯別平均**")
+          for b in buckets:
+              lines.append(
+                  f"{b['name']}({b['label']}): "
+                  f"下り {fmt(b['down_avg'], ' Mbps')} / "
+                  f"上り {fmt(b['up_avg'], ' Mbps')} / "
+                  f"Ping {fmt(b['ping_avg'], ' ms')} / "
+                  f"{b['count']}回"
+              )
+          lines.append("")
+          lines.append("**傾向メモ**")
+          if down_best and down_worst:
+              lines.append(
+                  f"下りは {down_best['name']} が速め（{fmt(down_best['down_avg'], ' Mbps')}）、"
+                  f"{down_worst['name']} が遅め（{fmt(down_worst['down_avg'], ' Mbps')}）。"
+              )
+          if up_best and up_worst:
+              lines.append(
+                  f"上りは {up_best['name']} が速め（{fmt(up_best['up_avg'], ' Mbps')}）、"
+                  f"{up_worst['name']} が遅め（{fmt(up_worst['up_avg'], ' Mbps')}）。"
+              )
+          if ping_best and ping_worst:
+              lines.append(
+                  f"Pingは {ping_best['name']} が良好（{fmt(ping_best['ping_avg'], ' ms')}）、"
+                  f"{ping_worst['name']} が重め（{fmt(ping_worst['ping_avg'], ' ms')}）。"
+              )
+
+          if not day_records:
+              lines = [
+                  "**VPN外部測定 日次サマリー**",
+                  "",
+                  f"対象日: {target_date}",
+                  "この日の保存データがまだない。data/iperf-results.jsonl に測定結果が保存されているか確認して。",
+              ]
+
+          content = "\n".join(lines)
+
+          if len(content) > 1900:
+              content = content[:1850] + "\n…（長すぎるので一部省略）"
+
+          Path("daily_summary.txt").write_text(content, encoding="utf-8")
+          print(content)
+          PY
+
+          python3 summarize_daily.py
+
+      - name: Notify Discord
+        if: always()
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          set +e
+
+          if [ -z "$DISCORD_WEBHOOK_URL" ]; then
+            echo "DISCORD_WEBHOOK_URL is not set. Skipping Discord notification."
+            exit 0
+          fi
+
+          jq -n --rawfile content daily_summary.txt '{content: $content}' > discord_payload.json
+
+          HTTP_CODE="$(curl -sS -o discord_response.txt -w "%{http_code}" \
+            -H "Content-Type: application/json" \
+            -d @discord_payload.json \
+            "$DISCORD_WEBHOOK_URL")"
+
+          echo "Discord HTTP status: $HTTP_CODE"
+          cat discord_response.txt || true
