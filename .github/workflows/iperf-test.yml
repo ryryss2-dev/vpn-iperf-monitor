@@ -1,0 +1,45 @@
+name: VPN iperf test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  iperf:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Install iperf3
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y iperf3 jq
+
+      - name: Run iperf3 tests
+        run: |
+          set +e
+
+          HOST="rayglintt11222.softether.net"
+          PORT="40017"
+
+          echo "=== TCP GitHub -> Home ==="
+          iperf3 -c "$HOST" -p "$PORT" -n 10M --json > tcp_to_home.json
+          TO_HOME_EXIT=$?
+
+          echo "=== TCP Home -> GitHub ==="
+          iperf3 -c "$HOST" -p "$PORT" -R -n 10M --json > tcp_from_home.json
+          FROM_HOME_EXIT=$?
+
+          TO_HOME_MBPS=$(jq -r '(.end.sum_sent.bits_per_second // 0) / 1000000' tcp_to_home.json 2>/dev/null)
+          FROM_HOME_MBPS=$(jq -r '(.end.sum_received.bits_per_second // 0) / 1000000' tcp_from_home.json 2>/dev/null)
+
+          echo "--------------------------------"
+          echo "To Home Mbps:     $TO_HOME_MBPS"
+          echo "From Home Mbps:   $FROM_HOME_MBPS"
+          echo "To Home exit:     $TO_HOME_EXIT"
+          echo "From Home exit:   $FROM_HOME_EXIT"
+          echo "--------------------------------"
+
+          if [ "$TO_HOME_EXIT" -ne 0 ] || [ "$FROM_HOME_EXIT" -ne 0 ]; then
+            echo "iperf3 failed"
+            exit 1
+          fi
