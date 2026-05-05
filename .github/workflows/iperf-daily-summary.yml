@@ -53,7 +53,7 @@ jobs:
               if value is None:
                   return None
               try:
-                  return int(value)
+                  return int(float(value))
               except Exception:
                   return None
 
@@ -108,23 +108,47 @@ jobs:
                   rr["down_mbps_f"] = to_float(r.get("down_mbps"))
                   rr["up_mbps_f"] = to_float(r.get("up_mbps"))
                   rr["ping_f"] = to_float(r.get("tcp_ping_avg_ms"))
+                  rr["ping_jitter_f"] = to_float(r.get("tcp_ping_jitter_ms"))
+                  rr["ping_stddev_f"] = to_float(r.get("tcp_ping_stddev_ms"))
                   rr["total_mb_f"] = to_float(r.get("total_mb"))
+                  rr["down_min_f"] = to_float(r.get("down_min_mbps"))
+                  rr["up_min_f"] = to_float(r.get("up_min_mbps"))
+                  rr["down_stability_f"] = to_float(r.get("down_stability_pct"))
+                  rr["up_stability_f"] = to_float(r.get("up_stability_pct"))
                   rr["hour_i"] = to_int(r.get("hour_jst"))
+                  rr["alert_status_norm"] = (r.get("alert_status") or r.get("status") or "UNKNOWN").upper()
                   out.append(rr)
               return out
 
-          def summarize(records):
-              ok = [
+          def metric_records(records):
+              return [
                   r for r in records
                   if r.get("status") == "OK"
                   and r.get("down_mbps_f") is not None
                   and r.get("up_mbps_f") is not None
                   and r.get("ping_f") is not None
               ]
+
+          def alert_counts(records):
+              counts = {"OK": 0, "WARNING": 0, "NG": 0, "UNKNOWN": 0}
+              for r in records:
+                  status = r.get("alert_status_norm") or "UNKNOWN"
+                  if status not in counts:
+                      status = "UNKNOWN"
+                  counts[status] += 1
+              return counts
+
+          def summarize(records):
+              ok = metric_records(records)
+              alerts = alert_counts(records)
               return {
                   "count": len(records),
                   "ok_count": len(ok),
                   "ng_count": len(records) - len(ok),
+                  "alert_ok": alerts["OK"],
+                  "alert_warning": alerts["WARNING"],
+                  "alert_ng": alerts["NG"],
+                  "alert_unknown": alerts["UNKNOWN"],
                   "down_avg": avg([r.get("down_mbps_f") for r in ok]),
                   "down_min": minv([r.get("down_mbps_f") for r in ok]),
                   "down_max": maxv([r.get("down_mbps_f") for r in ok]),
@@ -134,6 +158,13 @@ jobs:
                   "ping_avg": avg([r.get("ping_f") for r in ok]),
                   "ping_min": minv([r.get("ping_f") for r in ok]),
                   "ping_max": maxv([r.get("ping_f") for r in ok]),
+                  "jitter_avg": avg([r.get("ping_jitter_f") for r in ok]),
+                  "jitter_max": maxv([r.get("ping_jitter_f") for r in ok]),
+                  "ping_stddev_avg": avg([r.get("ping_stddev_f") for r in ok]),
+                  "down_instant_min": minv([r.get("down_min_f") for r in ok]),
+                  "up_instant_min": minv([r.get("up_min_f") for r in ok]),
+                  "down_stability_avg": avg([r.get("down_stability_f") for r in ok]),
+                  "up_stability_avg": avg([r.get("up_stability_f") for r in ok]),
                   "total_mb": sum([r.get("total_mb_f") or 0 for r in ok]),
               }
 
@@ -147,20 +178,22 @@ jobs:
               rows = []
               for name, label, hours in buckets:
                   items = [
-                      r for r in records
-                      if r.get("status") == "OK"
-                      and r.get("hour_i") in hours
-                      and r.get("down_mbps_f") is not None
-                      and r.get("up_mbps_f") is not None
-                      and r.get("ping_f") is not None
+                      r for r in metric_records(records)
+                      if r.get("hour_i") in hours
                   ]
+                  alerts = alert_counts(items)
                   rows.append({
                       "name": name,
                       "label": label,
                       "count": len(items),
+                      "warning": alerts["WARNING"],
+                      "ng": alerts["NG"],
                       "down_avg": avg([r.get("down_mbps_f") for r in items]),
                       "up_avg": avg([r.get("up_mbps_f") for r in items]),
                       "ping_avg": avg([r.get("ping_f") for r in items]),
+                      "jitter_avg": avg([r.get("ping_jitter_f") for r in items]),
+                      "down_stability_avg": avg([r.get("down_stability_f") for r in items]),
+                      "up_stability_avg": avg([r.get("up_stability_f") for r in items]),
                   })
               return rows
 
@@ -175,6 +208,17 @@ jobs:
                   best = max(valid, key=lambda r: r[key])
                   worst = min(valid, key=lambda r: r[key])
               return best, worst, valid
+
+          def record_time(r):
+              return r.get("timestamp_jst") or "時刻不明"
+
+          def worst_record(records, key, lower_is_worse=True):
+              valid = [r for r in metric_records(records) if r.get(key) is not None]
+              if not valid:
+                  return None
+              if lower_is_worse:
+                  return min(valid, key=lambda r: r[key])
+              return max(valid, key=lambda r: r[key])
 
           target_date = os.environ.get("TARGET_DATE", "").strip()
           if not target_date:
@@ -191,9 +235,17 @@ jobs:
           p = summarize(prev_records)
           buckets = bucket_summary(day_records)
 
-          down_best, down_worst, down_valid = best_worst_bucket(buckets, "down_avg", lower_is_better=False)
-          up_best, up_worst, up_valid = best_worst_bucket(buckets, "up_avg", lower_is_better=False)
-          ping_best, ping_worst, ping_valid = best_worst_bucket(buckets, "ping_avg", lower_is_better=True)
+          down_best, down_worst, _ = best_worst_bucket(buckets, "down_avg", lower_is_better=False)
+          up_best, up_worst, _ = best_worst_bucket(buckets, "up_avg", lower_is_better=False)
+          ping_best, ping_worst, _ = best_worst_bucket(buckets, "ping_avg", lower_is_better=True)
+          jitter_best, jitter_worst, _ = best_worst_bucket(buckets, "jitter_avg", lower_is_better=True)
+
+          worst_down_inst = worst_record(day_records, "down_min_f", lower_is_worse=True)
+          worst_up_inst = worst_record(day_records, "up_min_f", lower_is_worse=True)
+          worst_ping = worst_record(day_records, "ping_f", lower_is_worse=False)
+          worst_jitter = worst_record(day_records, "ping_jitter_f", lower_is_worse=False)
+          worst_down_stability = worst_record(day_records, "down_stability_f", lower_is_worse=True)
+          worst_up_stability = worst_record(day_records, "up_stability_f", lower_is_worse=True)
 
           lines = []
           lines.append("**VPN外部測定 日次サマリー**")
@@ -201,17 +253,26 @@ jobs:
           lines.append(f"対象日: {target_date}")
           lines.append(f"測定回数: {s['count']} / 予定{EXPECTED_PER_DAY}回")
           lines.append(f"成功: {s['ok_count']}回 / 失敗: {s['ng_count']}回")
+          lines.append(f"判定: OK {s['alert_ok']}回 / WARNING {s['alert_warning']}回 / NG {s['alert_ng']}回 / 不明 {s['alert_unknown']}回")
           lines.append("")
           lines.append("**平均・最高・最低**")
           lines.append(f"TCP Ping平均: {fmt(s['ping_avg'], ' ms')} / 最良 {fmt(s['ping_min'], ' ms')} / 最悪 {fmt(s['ping_max'], ' ms')}")
+          lines.append(f"TCP Pingジッター平均: {fmt(s['jitter_avg'], ' ms')} / 最大 {fmt(s['jitter_max'], ' ms')}")
           lines.append(f"下り平均: {fmt(s['down_avg'], ' Mbps')} / 最高 {fmt(s['down_max'], ' Mbps')} / 最低 {fmt(s['down_min'], ' Mbps')}")
           lines.append(f"上り平均: {fmt(s['up_avg'], ' Mbps')} / 最高 {fmt(s['up_max'], ' Mbps')} / 最低 {fmt(s['up_min'], ' Mbps')}")
+          lines.append("")
+          lines.append("**安定度**")
+          lines.append(f"下り最低瞬間: {fmt(s['down_instant_min'], ' Mbps')} / 下り安定度平均: {fmt(s['down_stability_avg'], '%')}")
+          lines.append(f"上り最低瞬間: {fmt(s['up_instant_min'], ' Mbps')} / 上り安定度平均: {fmt(s['up_stability_avg'], '%')}")
           lines.append(f"通信量合計: {fmt(s['total_mb'], ' MB')}")
           lines.append("")
           lines.append("**昨日比**")
           lines.append(f"TCP Ping: {fmt_delta(s['ping_avg'], p['ping_avg'], ' ms', lower_is_better=True)}")
+          lines.append(f"TCP Pingジッター: {fmt_delta(s['jitter_avg'], p['jitter_avg'], ' ms', lower_is_better=True)}")
           lines.append(f"下り: {fmt_delta(s['down_avg'], p['down_avg'], ' Mbps')}")
           lines.append(f"上り: {fmt_delta(s['up_avg'], p['up_avg'], ' Mbps')}")
+          lines.append(f"下り安定度: {fmt_delta(s['down_stability_avg'], p['down_stability_avg'], '%')}")
+          lines.append(f"上り安定度: {fmt_delta(s['up_stability_avg'], p['up_stability_avg'], '%')}")
           lines.append("")
           lines.append("**時間帯別平均**")
           for b in buckets:
@@ -220,41 +281,54 @@ jobs:
                   f"下り {fmt(b['down_avg'], ' Mbps')} / "
                   f"上り {fmt(b['up_avg'], ' Mbps')} / "
                   f"Ping {fmt(b['ping_avg'], ' ms')} / "
+                  f"Jitter {fmt(b['jitter_avg'], ' ms')} / "
+                  f"下り安定度 {fmt(b['down_stability_avg'], '%')} / "
                   f"{b['count']}回"
               )
+
+          lines.append("")
+          lines.append("**ワースト観測**")
+          if worst_down_inst:
+              lines.append(f"最低瞬間下り: {fmt(worst_down_inst.get('down_min_f'), ' Mbps')} / {record_time(worst_down_inst)}")
+          if worst_up_inst:
+              lines.append(f"最低瞬間上り: {fmt(worst_up_inst.get('up_min_f'), ' Mbps')} / {record_time(worst_up_inst)}")
+          if worst_ping:
+              lines.append(f"最悪Ping: {fmt(worst_ping.get('ping_f'), ' ms')} / {record_time(worst_ping)}")
+          if worst_jitter:
+              lines.append(f"最大ジッター: {fmt(worst_jitter.get('ping_jitter_f'), ' ms')} / {record_time(worst_jitter)}")
+          if worst_down_stability:
+              lines.append(f"最低下り安定度: {fmt(worst_down_stability.get('down_stability_f'), '%')} / {record_time(worst_down_stability)}")
+          if worst_up_stability:
+              lines.append(f"最低上り安定度: {fmt(worst_up_stability.get('up_stability_f'), '%')} / {record_time(worst_up_stability)}")
+
           lines.append("")
           lines.append("**傾向メモ**")
-
           valid_bucket_count = len([b for b in buckets if b.get("count", 0) > 0])
 
           if s["ok_count"] == 0:
-              lines.append("今日は成功データがまだないため、速度・Pingの傾向判断は保留。")
+              lines.append("今日は成功データがまだないため、速度・Ping・安定度の傾向判断は保留。")
           elif s["ok_count"] < 3:
-              lines.append(f"今日は成功データが{s['ok_count']}件だけなので、平均値は参考値。もう少し測定が貯まってから判断する。")
+              lines.append(f"今日は成功データが{s['ok_count']}件だけなので、平均値と安定度は参考値。もう少し測定が貯まってから判断する。")
           else:
-              lines.append(f"今日は成功データが{s['ok_count']}件あるため、平均値はある程度参考にできる。")
+              lines.append(f"今日は成功データが{s['ok_count']}件あるため、平均値と安定度はある程度参考にできる。")
 
           if valid_bucket_count < 2:
-              lines.append(
-                  "時間帯比較はデータ不足のため保留。"
-                  "有効な時間帯が2つ以上そろうと、昼が遅い・夜が速いなどの傾向を出す。"
-              )
+              lines.append("時間帯比較はデータ不足のため保留。有効な時間帯が2つ以上そろうと、昼が遅い・夜が速いなどの傾向を出す。")
           else:
               if down_best and down_worst:
-                  lines.append(
-                      f"下りは {down_best['name']} が速め（{fmt(down_best['down_avg'], ' Mbps')}）、"
-                      f"{down_worst['name']} が遅め（{fmt(down_worst['down_avg'], ' Mbps')}）。"
-                  )
+                  lines.append(f"下りは {down_best['name']} が速め（{fmt(down_best['down_avg'], ' Mbps')}）、{down_worst['name']} が遅め（{fmt(down_worst['down_avg'], ' Mbps')}）。")
               if up_best and up_worst:
-                  lines.append(
-                      f"上りは {up_best['name']} が速め（{fmt(up_best['up_avg'], ' Mbps')}）、"
-                      f"{up_worst['name']} が遅め（{fmt(up_worst['up_avg'], ' Mbps')}）。"
-                  )
+                  lines.append(f"上りは {up_best['name']} が速め（{fmt(up_best['up_avg'], ' Mbps')}）、{up_worst['name']} が遅め（{fmt(up_worst['up_avg'], ' Mbps')}）。")
               if ping_best and ping_worst:
-                  lines.append(
-                      f"Pingは {ping_best['name']} が良好（{fmt(ping_best['ping_avg'], ' ms')}）、"
-                      f"{ping_worst['name']} が重め（{fmt(ping_worst['ping_avg'], ' ms')}）。"
-                  )
+                  lines.append(f"Pingは {ping_best['name']} が良好（{fmt(ping_best['ping_avg'], ' ms')}）、{ping_worst['name']} が重め（{fmt(ping_worst['ping_avg'], ' ms')}）。")
+              if jitter_best and jitter_worst:
+                  lines.append(f"ジッターは {jitter_best['name']} が安定（{fmt(jitter_best['jitter_avg'], ' ms')}）、{jitter_worst['name']} が不安定（{fmt(jitter_worst['jitter_avg'], ' ms')}）。")
+
+          if s["alert_warning"] > 0 or s["alert_ng"] > 0:
+              lines.append(f"今日は WARNING/NG が合計 {s['alert_warning'] + s['alert_ng']}回あるので、Discord通常通知の該当回を確認するとよさそう。")
+          else:
+              if s["ok_count"] > 0:
+                  lines.append("今日は保存済みデータ上では WARNING/NG は出ていない。")
 
           if not day_records:
               lines = [
