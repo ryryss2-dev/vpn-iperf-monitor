@@ -85,6 +85,7 @@ jobs:
           echo "=== TCP connect latency to port 40017 ==="
           python3 - <<'PY' > tcp_latency.txt
           import json
+          import math
           import socket
           import statistics
           import time
@@ -108,12 +109,28 @@ jobs:
               time.sleep(0.5)
 
           if results:
+              min_ms = min(results)
+              avg_ms = statistics.mean(results)
+              max_ms = max(results)
+              jitter_ms = max_ms - min_ms
+              stddev_ms = statistics.pstdev(results) if len(results) >= 2 else 0.0
+
+              if jitter_ms < 30 and stddev_ms < 12:
+                  stability = "安定"
+              elif jitter_ms < 80 and stddev_ms < 35:
+                  stability = "やや不安定"
+              else:
+                  stability = "不安定"
+
               summary = {
                   "success": len(results),
                   "attempts": attempts,
-                  "min_ms": round(min(results), 1),
-                  "avg_ms": round(statistics.mean(results), 1),
-                  "max_ms": round(max(results), 1),
+                  "min_ms": round(min_ms, 1),
+                  "avg_ms": round(avg_ms, 1),
+                  "max_ms": round(max_ms, 1),
+                  "jitter_ms": round(jitter_ms, 1),
+                  "stddev_ms": round(stddev_ms, 1),
+                  "stability": stability,
               }
           else:
               summary = {
@@ -122,6 +139,9 @@ jobs:
                   "min_ms": None,
                   "avg_ms": None,
                   "max_ms": None,
+                  "jitter_ms": None,
+                  "stddev_ms": None,
+                  "stability": "取得不可",
               }
 
           print("--- TCP latency summary ---")
@@ -136,12 +156,18 @@ jobs:
           TCP_MIN="$(echo "$LATENCY_JSON_LINE" | jq -r '.min_ms // "unavailable"')"
           TCP_AVG="$(echo "$LATENCY_JSON_LINE" | jq -r '.avg_ms // "unavailable"')"
           TCP_MAX="$(echo "$LATENCY_JSON_LINE" | jq -r '.max_ms // "unavailable"')"
+          TCP_JITTER="$(echo "$LATENCY_JSON_LINE" | jq -r '.jitter_ms // "unavailable"')"
+          TCP_STDDEV="$(echo "$LATENCY_JSON_LINE" | jq -r '.stddev_ms // "unavailable"')"
+          TCP_STABILITY="$(echo "$LATENCY_JSON_LINE" | jq -r '.stability // "unknown"')"
 
           echo "tcp_success=$TCP_SUCCESS" >> "$GITHUB_OUTPUT"
           echo "tcp_attempts=$TCP_ATTEMPTS" >> "$GITHUB_OUTPUT"
           echo "tcp_min_ms=$TCP_MIN" >> "$GITHUB_OUTPUT"
           echo "tcp_avg_ms=$TCP_AVG" >> "$GITHUB_OUTPUT"
           echo "tcp_max_ms=$TCP_MAX" >> "$GITHUB_OUTPUT"
+          echo "tcp_jitter_ms=$TCP_JITTER" >> "$GITHUB_OUTPUT"
+          echo "tcp_stddev_ms=$TCP_STDDEV" >> "$GITHUB_OUTPUT"
+          echo "tcp_stability=$TCP_STABILITY" >> "$GITHUB_OUTPUT"
 
           echo
           echo "=== TCP port check ==="
@@ -209,19 +235,125 @@ jobs:
             iperf3 -c "$HOST" -p "$PORT" -R -t 5
           UP_EXIT=$?
 
-          DOWN_MBPS=$(jq -r '(.end.sum_sent.bits_per_second // .end.sum_received.bits_per_second // 0) / 1000000' tcp_to_home.json 2>/dev/null)
-          UP_MBPS=$(jq -r '(.end.sum_received.bits_per_second // .end.sum_sent.bits_per_second // 0) / 1000000' tcp_from_home.json 2>/dev/null)
+          python3 - <<'PY' > speed_summary.json
+          import json
+          import math
+          import statistics
+          from pathlib import Path
 
-          DOWN_BYTES=$(jq -r '(.end.sum_sent.bytes // .end.sum_received.bytes // 0)' tcp_to_home.json 2>/dev/null)
-          UP_BYTES=$(jq -r '(.end.sum_received.bytes // .end.sum_sent.bytes // 0)' tcp_from_home.json 2>/dev/null)
+          def load_json(path):
+              try:
+                  return json.loads(Path(path).read_text(encoding="utf-8"))
+              except Exception:
+                  return {}
 
-          DOWN_MBPS_ROUNDED=$(printf "%.1f" "$DOWN_MBPS")
-          UP_MBPS_ROUNDED=$(printf "%.1f" "$UP_MBPS")
+          def n(value):
+              try:
+                  return float(value)
+              except Exception:
+                  return None
 
-          DOWN_MB=$(awk -v b="$DOWN_BYTES" 'BEGIN { printf "%.1f", b / 1000000 }')
-          UP_MB=$(awk -v b="$UP_BYTES" 'BEGIN { printf "%.1f", b / 1000000 }')
-          TOTAL_BYTES=$((DOWN_BYTES + UP_BYTES))
-          TOTAL_MB=$(awk -v b="$TOTAL_BYTES" 'BEGIN { printf "%.1f", b / 1000000 }')
+          def interval_mbps(data):
+              values = []
+              for item in data.get("intervals", []):
+                  bps = n(item.get("sum", {}).get("bits_per_second"))
+                  if bps is not None:
+                      values.append(bps / 1_000_000)
+              return values
+
+          def classify_stability(avg_value, min_value, stddev_value, stability_pct):
+              if avg_value is None or min_value is None or stddev_value is None or stability_pct is None:
+                  return "取得不可"
+              if stability_pct >= 80 and stddev_value <= max(avg_value * 0.15, 2):
+                  return "安定"
+              if stability_pct >= 50 and stddev_value <= max(avg_value * 0.35, 5):
+                  return "やや不安定"
+              return "不安定"
+
+          def summarize_speed(data, mode):
+              end = data.get("end", {})
+
+              if mode == "down":
+                  avg_bps = n(end.get("sum_sent", {}).get("bits_per_second"))
+                  if avg_bps is None:
+                      avg_bps = n(end.get("sum_received", {}).get("bits_per_second"))
+                  bytes_value = n(end.get("sum_sent", {}).get("bytes"))
+                  if bytes_value is None:
+                      bytes_value = n(end.get("sum_received", {}).get("bytes"))
+              else:
+                  avg_bps = n(end.get("sum_received", {}).get("bits_per_second"))
+                  if avg_bps is None:
+                      avg_bps = n(end.get("sum_sent", {}).get("bits_per_second"))
+                  bytes_value = n(end.get("sum_received", {}).get("bytes"))
+                  if bytes_value is None:
+                      bytes_value = n(end.get("sum_sent", {}).get("bytes"))
+
+              avg_mbps = (avg_bps / 1_000_000) if avg_bps is not None else None
+              mb_value = (bytes_value / 1_000_000) if bytes_value is not None else None
+
+              intervals = interval_mbps(data)
+              if intervals:
+                  min_mbps = min(intervals)
+                  max_mbps = max(intervals)
+                  stddev_mbps = statistics.pstdev(intervals) if len(intervals) >= 2 else 0.0
+                  interval_avg_mbps = statistics.mean(intervals)
+                  stability_pct = (min_mbps / interval_avg_mbps * 100) if interval_avg_mbps > 0 else None
+              else:
+                  min_mbps = None
+                  max_mbps = None
+                  stddev_mbps = None
+                  stability_pct = None
+
+              stability_label = classify_stability(avg_mbps, min_mbps, stddev_mbps, stability_pct)
+
+              return {
+                  "avg_mbps": round(avg_mbps, 1) if avg_mbps is not None else None,
+                  "mb": round(mb_value, 1) if mb_value is not None else None,
+                  "interval_min_mbps": round(min_mbps, 1) if min_mbps is not None else None,
+                  "interval_max_mbps": round(max_mbps, 1) if max_mbps is not None else None,
+                  "interval_stddev_mbps": round(stddev_mbps, 1) if stddev_mbps is not None else None,
+                  "stability_pct": round(stability_pct, 1) if stability_pct is not None else None,
+                  "stability_label": stability_label,
+              }
+
+          down_data = load_json("tcp_to_home.json")
+          up_data = load_json("tcp_from_home.json")
+
+          down = summarize_speed(down_data, "down")
+          up = summarize_speed(up_data, "up")
+
+          total_mb = None
+          if down.get("mb") is not None and up.get("mb") is not None:
+              total_mb = round(down["mb"] + up["mb"], 1)
+
+          result = {
+              "down": down,
+              "up": up,
+              "total_mb": total_mb,
+          }
+
+          print(json.dumps(result, ensure_ascii=False, indent=2))
+          PY
+
+          cat speed_summary.json
+
+          DOWN_MBPS_ROUNDED="$(jq -r '.down.avg_mbps // 0' speed_summary.json)"
+          UP_MBPS_ROUNDED="$(jq -r '.up.avg_mbps // 0' speed_summary.json)"
+          DOWN_MB="$(jq -r '.down.mb // 0' speed_summary.json)"
+          UP_MB="$(jq -r '.up.mb // 0' speed_summary.json)"
+          TOTAL_MB="$(jq -r '.total_mb // 0' speed_summary.json)"
+
+          DOWN_MIN_MBPS="$(jq -r '.down.interval_min_mbps // "unavailable"' speed_summary.json)"
+          DOWN_MAX_MBPS="$(jq -r '.down.interval_max_mbps // "unavailable"' speed_summary.json)"
+          DOWN_STDDEV_MBPS="$(jq -r '.down.interval_stddev_mbps // "unavailable"' speed_summary.json)"
+          DOWN_STABILITY_PCT="$(jq -r '.down.stability_pct // "unavailable"' speed_summary.json)"
+          DOWN_STABILITY_LABEL="$(jq -r '.down.stability_label // "unknown"' speed_summary.json)"
+
+          UP_MIN_MBPS="$(jq -r '.up.interval_min_mbps // "unavailable"' speed_summary.json)"
+          UP_MAX_MBPS="$(jq -r '.up.interval_max_mbps // "unavailable"' speed_summary.json)"
+          UP_STDDEV_MBPS="$(jq -r '.up.interval_stddev_mbps // "unavailable"' speed_summary.json)"
+          UP_STABILITY_PCT="$(jq -r '.up.stability_pct // "unavailable"' speed_summary.json)"
+          UP_STABILITY_LABEL="$(jq -r '.up.stability_label // "unknown"' speed_summary.json)"
 
           echo "--------------------------------"
           echo "下り（外部→自宅）Mbps: $DOWN_MBPS_ROUNDED"
@@ -234,6 +366,10 @@ jobs:
           echo "上り（自宅→外部）: ${UP_MB} MB"
           echo "合計: ${TOTAL_MB} MB"
           echo "--------------------------------"
+          echo "速度安定度:"
+          echo "下り min/max/stddev/stability: $DOWN_MIN_MBPS / $DOWN_MAX_MBPS / $DOWN_STDDEV_MBPS / $DOWN_STABILITY_PCT% / $DOWN_STABILITY_LABEL"
+          echo "上り min/max/stddev/stability: $UP_MIN_MBPS / $UP_MAX_MBPS / $UP_STDDEV_MBPS / $UP_STABILITY_PCT% / $UP_STABILITY_LABEL"
+          echo "--------------------------------"
 
           echo "down_mbps=$DOWN_MBPS_ROUNDED" >> "$GITHUB_OUTPUT"
           echo "up_mbps=$UP_MBPS_ROUNDED" >> "$GITHUB_OUTPUT"
@@ -242,6 +378,18 @@ jobs:
           echo "down_mb=$DOWN_MB" >> "$GITHUB_OUTPUT"
           echo "up_mb=$UP_MB" >> "$GITHUB_OUTPUT"
           echo "total_mb=$TOTAL_MB" >> "$GITHUB_OUTPUT"
+
+          echo "down_min_mbps=$DOWN_MIN_MBPS" >> "$GITHUB_OUTPUT"
+          echo "down_max_mbps=$DOWN_MAX_MBPS" >> "$GITHUB_OUTPUT"
+          echo "down_stddev_mbps=$DOWN_STDDEV_MBPS" >> "$GITHUB_OUTPUT"
+          echo "down_stability_pct=$DOWN_STABILITY_PCT" >> "$GITHUB_OUTPUT"
+          echo "down_stability_label=$DOWN_STABILITY_LABEL" >> "$GITHUB_OUTPUT"
+
+          echo "up_min_mbps=$UP_MIN_MBPS" >> "$GITHUB_OUTPUT"
+          echo "up_max_mbps=$UP_MAX_MBPS" >> "$GITHUB_OUTPUT"
+          echo "up_stddev_mbps=$UP_STDDEV_MBPS" >> "$GITHUB_OUTPUT"
+          echo "up_stability_pct=$UP_STABILITY_PCT" >> "$GITHUB_OUTPUT"
+          echo "up_stability_label=$UP_STABILITY_LABEL" >> "$GITHUB_OUTPUT"
 
           if [ "$DOWN_EXIT" -ne 0 ] || [ "$UP_EXIT" -ne 0 ]; then
             echo "iperf3 failed after retries"
@@ -256,14 +404,25 @@ jobs:
           DOWN_MBPS: ${{ steps.speed.outputs.down_mbps }}
           UP_MBPS: ${{ steps.speed.outputs.up_mbps }}
           TCP_AVG_MS: ${{ steps.ping.outputs.tcp_avg_ms }}
+          TCP_JITTER_MS: ${{ steps.ping.outputs.tcp_jitter_ms }}
+          TCP_STDDEV_MS: ${{ steps.ping.outputs.tcp_stddev_ms }}
           TCP_SUCCESS: ${{ steps.ping.outputs.tcp_success }}
           TCP_ATTEMPTS: ${{ steps.ping.outputs.tcp_attempts }}
           DOWN_EXIT: ${{ steps.speed.outputs.down_exit }}
           UP_EXIT: ${{ steps.speed.outputs.up_exit }}
           TCP_PORT_EXIT: ${{ steps.ping.outputs.tcp_port_exit }}
+          DOWN_MIN_MBPS: ${{ steps.speed.outputs.down_min_mbps }}
+          UP_MIN_MBPS: ${{ steps.speed.outputs.up_min_mbps }}
+          DOWN_STABILITY_PCT: ${{ steps.speed.outputs.down_stability_pct }}
+          UP_STABILITY_PCT: ${{ steps.speed.outputs.up_stability_pct }}
           DOWN_WARN_MBPS: "10"
           UP_WARN_MBPS: "30"
           PING_WARN_MS: "250"
+          PING_JITTER_WARN_MS: "80"
+          PING_STDDEV_WARN_MS: "35"
+          SPEED_STABILITY_WARN_PCT: "50"
+          DOWN_MIN_WARN_MBPS: "5"
+          UP_MIN_WARN_MBPS: "10"
         run: |
           set +e
 
@@ -291,12 +450,24 @@ jobs:
           down = f("DOWN_MBPS")
           up = f("UP_MBPS")
           ping = f("TCP_AVG_MS")
+          ping_jitter = f("TCP_JITTER_MS")
+          ping_stddev = f("TCP_STDDEV_MS")
           tcp_success = i("TCP_SUCCESS")
           tcp_attempts = i("TCP_ATTEMPTS") or 10
+
+          down_min = f("DOWN_MIN_MBPS")
+          up_min = f("UP_MIN_MBPS")
+          down_stability_pct = f("DOWN_STABILITY_PCT")
+          up_stability_pct = f("UP_STABILITY_PCT")
 
           down_warn = f("DOWN_WARN_MBPS") or 10.0
           up_warn = f("UP_WARN_MBPS") or 30.0
           ping_warn = f("PING_WARN_MS") or 250.0
+          ping_jitter_warn = f("PING_JITTER_WARN_MS") or 80.0
+          ping_stddev_warn = f("PING_STDDEV_WARN_MS") or 35.0
+          speed_stability_warn = f("SPEED_STABILITY_WARN_PCT") or 50.0
+          down_min_warn = f("DOWN_MIN_WARN_MBPS") or 5.0
+          up_min_warn = f("UP_MIN_WARN_MBPS") or 10.0
 
           down_exit = s("DOWN_EXIT", "unknown")
           up_exit = s("UP_EXIT", "unknown")
@@ -317,22 +488,40 @@ jobs:
           if down is None:
               warn.append("下り速度が取得できなかった")
           elif down < down_warn:
-              warn.append(f"下りが低い: {down:.1f} Mbps < {down_warn:.1f} Mbps")
+              warn.append(f"下り平均が低い: {down:.1f} Mbps < {down_warn:.1f} Mbps")
 
           if up is None:
               warn.append("上り速度が取得できなかった")
           elif up < up_warn:
-              warn.append(f"上りが低い: {up:.1f} Mbps < {up_warn:.1f} Mbps")
+              warn.append(f"上り平均が低い: {up:.1f} Mbps < {up_warn:.1f} Mbps")
 
           if ping is None:
               warn.append("TCP Ping相当が取得できなかった")
           elif ping >= ping_warn:
               warn.append(f"TCP Pingが重い: {ping:.1f} ms >= {ping_warn:.1f} ms")
 
+          if ping_jitter is not None and ping_jitter >= ping_jitter_warn:
+              warn.append(f"TCP Pingジッターが大きい: {ping_jitter:.1f} ms >= {ping_jitter_warn:.1f} ms")
+
+          if ping_stddev is not None and ping_stddev >= ping_stddev_warn:
+              warn.append(f"TCP Pingばらつきが大きい: stddev {ping_stddev:.1f} ms >= {ping_stddev_warn:.1f} ms")
+
           if tcp_success is None:
               warn.append("TCP Ping成功数が取得できなかった")
           elif tcp_success < tcp_attempts:
               warn.append(f"TCP Ping成功数が不足: {tcp_success}/{tcp_attempts}")
+
+          if down_min is not None and down_min < down_min_warn:
+              warn.append(f"下りの最低瞬間速度が低い: {down_min:.1f} Mbps < {down_min_warn:.1f} Mbps")
+
+          if up_min is not None and up_min < up_min_warn:
+              warn.append(f"上りの最低瞬間速度が低い: {up_min:.1f} Mbps < {up_min_warn:.1f} Mbps")
+
+          if down_stability_pct is not None and down_stability_pct < speed_stability_warn:
+              warn.append(f"下り速度が不安定: 安定度 {down_stability_pct:.1f}% < {speed_stability_warn:.1f}%")
+
+          if up_stability_pct is not None and up_stability_pct < speed_stability_warn:
+              warn.append(f"上り速度が不安定: 安定度 {up_stability_pct:.1f}% < {speed_stability_warn:.1f}%")
 
           if ng:
               status = "NG"
@@ -352,6 +541,11 @@ jobs:
                   "down_warn_mbps": down_warn,
                   "up_warn_mbps": up_warn,
                   "ping_warn_ms": ping_warn,
+                  "ping_jitter_warn_ms": ping_jitter_warn,
+                  "ping_stddev_warn_ms": ping_stddev_warn,
+                  "speed_stability_warn_pct": speed_stability_warn,
+                  "down_min_warn_mbps": down_min_warn,
+                  "up_min_warn_mbps": up_min_warn,
               },
           }
 
@@ -408,22 +602,52 @@ jobs:
           TCP_AVG="${{ steps.ping.outputs.tcp_avg_ms }}"
           TCP_MIN="${{ steps.ping.outputs.tcp_min_ms }}"
           TCP_MAX="${{ steps.ping.outputs.tcp_max_ms }}"
+          TCP_JITTER="${{ steps.ping.outputs.tcp_jitter_ms }}"
+          TCP_STDDEV="${{ steps.ping.outputs.tcp_stddev_ms }}"
+          TCP_STABILITY="${{ steps.ping.outputs.tcp_stability }}"
           TOTAL_MB="${{ steps.speed.outputs.total_mb }}"
           DOWN_MB="${{ steps.speed.outputs.down_mb }}"
           UP_MB="${{ steps.speed.outputs.up_mb }}"
           TCP_SUCCESS="${{ steps.ping.outputs.tcp_success }}"
           TCP_ATTEMPTS="${{ steps.ping.outputs.tcp_attempts }}"
 
+          DOWN_MIN="${{ steps.speed.outputs.down_min_mbps }}"
+          DOWN_MAX="${{ steps.speed.outputs.down_max_mbps }}"
+          DOWN_STDDEV="${{ steps.speed.outputs.down_stddev_mbps }}"
+          DOWN_STABILITY_PCT="${{ steps.speed.outputs.down_stability_pct }}"
+          DOWN_STABILITY_LABEL="${{ steps.speed.outputs.down_stability_label }}"
+
+          UP_MIN="${{ steps.speed.outputs.up_min_mbps }}"
+          UP_MAX="${{ steps.speed.outputs.up_max_mbps }}"
+          UP_STDDEV="${{ steps.speed.outputs.up_stddev_mbps }}"
+          UP_STABILITY_PCT="${{ steps.speed.outputs.up_stability_pct }}"
+          UP_STABILITY_LABEL="${{ steps.speed.outputs.up_stability_label }}"
+
           DOWN_MBPS="${DOWN_MBPS:-0}"
           UP_MBPS="${UP_MBPS:-0}"
           TCP_AVG="${TCP_AVG:-0}"
           TCP_MIN="${TCP_MIN:-0}"
           TCP_MAX="${TCP_MAX:-0}"
+          TCP_JITTER="${TCP_JITTER:-0}"
+          TCP_STDDEV="${TCP_STDDEV:-0}"
+          TCP_STABILITY="${TCP_STABILITY:-unknown}"
           TOTAL_MB="${TOTAL_MB:-0}"
           DOWN_MB="${DOWN_MB:-0}"
           UP_MB="${UP_MB:-0}"
           TCP_SUCCESS="${TCP_SUCCESS:-0}"
           TCP_ATTEMPTS="${TCP_ATTEMPTS:-10}"
+
+          DOWN_MIN="${DOWN_MIN:-0}"
+          DOWN_MAX="${DOWN_MAX:-0}"
+          DOWN_STDDEV="${DOWN_STDDEV:-0}"
+          DOWN_STABILITY_PCT="${DOWN_STABILITY_PCT:-0}"
+          DOWN_STABILITY_LABEL="${DOWN_STABILITY_LABEL:-unknown}"
+
+          UP_MIN="${UP_MIN:-0}"
+          UP_MAX="${UP_MAX:-0}"
+          UP_STDDEV="${UP_STDDEV:-0}"
+          UP_STABILITY_PCT="${UP_STABILITY_PCT:-0}"
+          UP_STABILITY_LABEL="${UP_STABILITY_LABEL:-unknown}"
 
           jq -c -n \
             --arg timestamp_jst "$NOW_JST" \
@@ -435,16 +659,33 @@ jobs:
             --arg trigger "${{ github.event_name }}" \
             --arg run_id "${{ github.run_id }}" \
             --arg run_number "${{ github.run_number }}" \
+            --arg source_org "${{ steps.source.outputs.org }}" \
+            --arg source_city "${{ steps.source.outputs.city }}" \
+            --arg source_region "${{ steps.source.outputs.region }}" \
+            --arg source_country "${{ steps.source.outputs.country }}" \
             --arg down_mbps "$DOWN_MBPS" \
             --arg up_mbps "$UP_MBPS" \
             --arg tcp_ping_avg_ms "$TCP_AVG" \
             --arg tcp_ping_min_ms "$TCP_MIN" \
             --arg tcp_ping_max_ms "$TCP_MAX" \
+            --arg tcp_ping_jitter_ms "$TCP_JITTER" \
+            --arg tcp_ping_stddev_ms "$TCP_STDDEV" \
+            --arg tcp_ping_stability "$TCP_STABILITY" \
             --arg tcp_success "$TCP_SUCCESS" \
             --arg tcp_attempts "$TCP_ATTEMPTS" \
             --arg down_mb "$DOWN_MB" \
             --arg up_mb "$UP_MB" \
             --arg total_mb "$TOTAL_MB" \
+            --arg down_min_mbps "$DOWN_MIN" \
+            --arg down_max_mbps "$DOWN_MAX" \
+            --arg down_stddev_mbps "$DOWN_STDDEV" \
+            --arg down_stability_pct "$DOWN_STABILITY_PCT" \
+            --arg down_stability_label "$DOWN_STABILITY_LABEL" \
+            --arg up_min_mbps "$UP_MIN" \
+            --arg up_max_mbps "$UP_MAX" \
+            --arg up_stddev_mbps "$UP_STDDEV" \
+            --arg up_stability_pct "$UP_STABILITY_PCT" \
+            --arg up_stability_label "$UP_STABILITY_LABEL" \
             --arg down_exit "${DOWN_EXIT:-unknown}" \
             --arg up_exit "${UP_EXIT:-unknown}" \
             --arg tcp_port_exit "${TCP_PORT_EXIT:-unknown}" \
@@ -460,16 +701,33 @@ jobs:
               trigger: $trigger,
               run_id: $run_id,
               run_number: ($run_number | n),
+              source_org: $source_org,
+              source_city: $source_city,
+              source_region: $source_region,
+              source_country: $source_country,
               down_mbps: ($down_mbps | n),
               up_mbps: ($up_mbps | n),
               tcp_ping_avg_ms: ($tcp_ping_avg_ms | n),
               tcp_ping_min_ms: ($tcp_ping_min_ms | n),
               tcp_ping_max_ms: ($tcp_ping_max_ms | n),
+              tcp_ping_jitter_ms: ($tcp_ping_jitter_ms | n),
+              tcp_ping_stddev_ms: ($tcp_ping_stddev_ms | n),
+              tcp_ping_stability: $tcp_ping_stability,
               tcp_success: ($tcp_success | n),
               tcp_attempts: ($tcp_attempts | n),
               down_mb: ($down_mb | n),
               up_mb: ($up_mb | n),
               total_mb: ($total_mb | n),
+              down_min_mbps: ($down_min_mbps | n),
+              down_max_mbps: ($down_max_mbps | n),
+              down_stddev_mbps: ($down_stddev_mbps | n),
+              down_stability_pct: ($down_stability_pct | n),
+              down_stability_label: $down_stability_label,
+              up_min_mbps: ($up_min_mbps | n),
+              up_max_mbps: ($up_max_mbps | n),
+              up_stddev_mbps: ($up_stddev_mbps | n),
+              up_stability_pct: ($up_stability_pct | n),
+              up_stability_label: $up_stability_label,
               down_exit: $down_exit,
               up_exit: $up_exit,
               tcp_port_exit: $tcp_port_exit
@@ -523,15 +781,6 @@ jobs:
 
           SCHEDULE_TEXT="HM80タスクスケジューラから2時間ごとに起動：00:17 / 02:17 / 04:17 / 06:17 / 08:17 / 10:17 / 12:17 / 14:17 / 16:17 / 18:17 / 20:17 / 22:17 JST"
 
-          DOWN_EXIT="${{ steps.speed.outputs.down_exit }}"
-          UP_EXIT="${{ steps.speed.outputs.up_exit }}"
-          TCP_PORT_EXIT="${{ steps.ping.outputs.tcp_port_exit }}"
-
-          MEASURE_STATUS="OK"
-          if [ "$DOWN_EXIT" != "0" ] || [ "$UP_EXIT" != "0" ] || [ "$TCP_PORT_EXIT" != "0" ]; then
-            MEASURE_STATUS="NG"
-          fi
-
           ALERT_STATUS="${{ steps.alert.outputs.alert_status }}"
           ALERT_REASONS="$(cat <<'EOF_ALERT'
           ${{ steps.alert.outputs.alert_reasons }}
@@ -567,11 +816,18 @@ jobs:
 
           **遅延**
           TCP Ping相当: avg ${{ steps.ping.outputs.tcp_avg_ms }} ms / min ${{ steps.ping.outputs.tcp_min_ms }} ms / max ${{ steps.ping.outputs.tcp_max_ms }} ms / success ${{ steps.ping.outputs.tcp_success }}/${{ steps.ping.outputs.tcp_attempts }}
+          TCP Pingジッター: ${{ steps.ping.outputs.tcp_jitter_ms }} ms
+          TCP Pingばらつき: stddev ${{ steps.ping.outputs.tcp_stddev_ms }} ms
+          TCP Ping安定度: ${{ steps.ping.outputs.tcp_stability }}
           ICMP Ping: ${{ steps.ping.outputs.ping_loss }}
 
           **速度**
           下り（外部→自宅）: ${{ steps.speed.outputs.down_mbps }} Mbps
           上り（自宅→外部）: ${{ steps.speed.outputs.up_mbps }} Mbps
+
+          **速度安定度**
+          下り: 最低 ${{ steps.speed.outputs.down_min_mbps }} Mbps / 最高 ${{ steps.speed.outputs.down_max_mbps }} Mbps / stddev ${{ steps.speed.outputs.down_stddev_mbps }} Mbps / 安定度 ${{ steps.speed.outputs.down_stability_pct }}% / ${{ steps.speed.outputs.down_stability_label }}
+          上り: 最低 ${{ steps.speed.outputs.up_min_mbps }} Mbps / 最高 ${{ steps.speed.outputs.up_max_mbps }} Mbps / stddev ${{ steps.speed.outputs.up_stddev_mbps }} Mbps / 安定度 ${{ steps.speed.outputs.up_stability_pct }}% / ${{ steps.speed.outputs.up_stability_label }}
 
           **通信量目安**
           iperf本体のみ・IP/TCP等のオーバーヘッド除く
