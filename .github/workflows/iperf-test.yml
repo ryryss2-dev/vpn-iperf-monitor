@@ -10,10 +10,15 @@ concurrency:
 permissions:
   contents: write
 
+env:
+  TEST_SECONDS: "20"
+  OMIT_SECONDS: "2"
+  TCP_LATENCY_ATTEMPTS: "20"
+
 jobs:
   iperf:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 18
 
     steps:
       - name: Checkout repository
@@ -71,13 +76,14 @@ jobs:
           echo "=== TCP connect latency to port 40017 ==="
           python3 - <<'PY' > tcp_latency.txt
           import json
+          import os
           import socket
           import statistics
           import time
 
           host = "rayglintt11222.softether.net"
           port = 40017
-          attempts = 10
+          attempts = int(os.environ.get("TCP_LATENCY_ATTEMPTS", "20"))
           timeout = 5.0
           results = []
 
@@ -91,7 +97,7 @@ jobs:
               except Exception as e:
                   elapsed_ms = (time.perf_counter() - start) * 1000
                   print(f"tcp_connect_{i}: fail {elapsed_ms:.1f} ms error={e}")
-              time.sleep(0.5)
+              time.sleep(0.35)
 
           if results:
               min_ms = min(results)
@@ -137,7 +143,7 @@ jobs:
           LATENCY_JSON_LINE="$(tail -1 tcp_latency.txt)"
 
           TCP_SUCCESS="$(echo "$LATENCY_JSON_LINE" | jq -r '.success // 0')"
-          TCP_ATTEMPTS="$(echo "$LATENCY_JSON_LINE" | jq -r '.attempts // 10')"
+          TCP_ATTEMPTS="$(echo "$LATENCY_JSON_LINE" | jq -r '.attempts // 20')"
           TCP_MIN="$(echo "$LATENCY_JSON_LINE" | jq -r '.min_ms // "unavailable"')"
           TCP_AVG="$(echo "$LATENCY_JSON_LINE" | jq -r '.avg_ms // "unavailable"')"
           TCP_MAX="$(echo "$LATENCY_JSON_LINE" | jq -r '.max_ms // "unavailable"')"
@@ -197,18 +203,20 @@ jobs:
             return "$exit_code"
           }
 
+          echo "=== Down 外部→自宅 / ${TEST_SECONDS}s omit ${OMIT_SECONDS}s ==="
           run_iperf_with_retry \
             "Down 外部→自宅" \
             "tcp_to_home.json" \
-            iperf3 -c "$HOST" -p "$PORT" -t 5
+            iperf3 -c "$HOST" -p "$PORT" -t "$TEST_SECONDS" -O "$OMIT_SECONDS"
           DOWN_EXIT=$?
 
           sleep 3
 
+          echo "=== Up 自宅→外部 / ${TEST_SECONDS}s omit ${OMIT_SECONDS}s ==="
           run_iperf_with_retry \
             "Up 自宅→外部" \
             "tcp_from_home.json" \
-            iperf3 -c "$HOST" -p "$PORT" -R -t 5
+            iperf3 -c "$HOST" -p "$PORT" -R -t "$TEST_SECONDS" -O "$OMIT_SECONDS"
           UP_EXIT=$?
 
           python3 - <<'PY' > speed_summary.json
@@ -374,7 +382,7 @@ jobs:
           jitter = f("TCP_JITTER_MS")
           ping_stddev = f("TCP_STDDEV_MS")
           tcp_success = i("TCP_SUCCESS")
-          tcp_attempts = i("TCP_ATTEMPTS") or 10
+          tcp_attempts = i("TCP_ATTEMPTS") or 20
           down_min = f("DOWN_MIN_MBPS")
           up_min = f("UP_MIN_MBPS")
           down_stability = f("DOWN_STABILITY_PCT")
@@ -501,6 +509,9 @@ jobs:
             --arg source_city "${{ steps.source.outputs.city }}" \
             --arg source_region "${{ steps.source.outputs.region }}" \
             --arg source_country "${{ steps.source.outputs.country }}" \
+            --arg test_seconds "$TEST_SECONDS" \
+            --arg omit_seconds "$OMIT_SECONDS" \
+            --arg tcp_latency_attempts "$TCP_LATENCY_ATTEMPTS" \
             --arg down_mbps "${{ steps.speed.outputs.down_mbps }}" \
             --arg up_mbps "${{ steps.speed.outputs.up_mbps }}" \
             --arg tcp_ping_avg_ms "${{ steps.ping.outputs.tcp_avg_ms }}" \
@@ -543,6 +554,9 @@ jobs:
               source_city: $source_city,
               source_region: $source_region,
               source_country: $source_country,
+              test_seconds: ($test_seconds | n),
+              omit_seconds: ($omit_seconds | n),
+              tcp_latency_attempts: ($tcp_latency_attempts | n),
               down_mbps: ($down_mbps | n),
               up_mbps: ($up_mbps | n),
               tcp_ping_avg_ms: ($tcp_ping_avg_ms | n),
@@ -624,6 +638,7 @@ jobs:
           **VPN外部測定 ${ALERT_STATUS}**
 
           実行時刻: ${NOW_JST}
+          測定長: ${TEST_SECONDS}s x 2方向 / omit ${OMIT_SECONDS}s
           起動元: HM80 Task Scheduler / GitHub API
 
           **しきい値判定**
@@ -655,6 +670,11 @@ jobs:
           ${NEXT_JST}
           EOF
           )"
+
+          if [ "${#CONTENT}" -gt 1900 ]; then
+            CONTENT="${CONTENT:0:1850}
+          …省略"
+          fi
 
           echo "$CONTENT" >> "$GITHUB_STEP_SUMMARY"
 
